@@ -1,0 +1,31 @@
+# homecore-server only build
+# Avoids wifi-densepose-sensing-server / hnsw_rs dependency chain
+
+FROM rust:1.89-bookworm AS builder
+
+WORKDIR /build
+
+COPY v2/Cargo.toml v2/Cargo.lock ./
+COPY v2/crates/ ./crates/
+COPY vendor/ruvector/ /build/vendor/ruvector/
+
+RUN cargo build --release -p homecore-server 2>&1 \
+ && strip target/release/homecore-server
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/homecore-server /app/homecore-server
+
+ENV RUST_LOG=info
+ENV RUVIEW_API_TOKEN=
+
+EXPOSE 8123
+
+ENTRYPOINT ["/app/homecore-server"]
+CMD []
