@@ -1107,6 +1107,55 @@ fn parse_esp32_vitals(buf: &[u8]) -> Option<Esp32VitalsPacket> {
     })
 }
 
+// ── ADR-081: Feature State Packet (magic 0xC5110006) ─────────────────────────
+
+/// Decoded ADR-081 rv_feature_state_t packet (60 bytes).
+#[derive(Debug, Clone, Serialize)]
+struct RvFeatureStatePacket {
+    node_id: u8,
+    mode: u8,
+    seq: u16,
+    ts_us: u64,
+    motion_score: f32,
+    presence_score: f32,
+    respiration_bpm: f32,
+    respiration_conf: f32,
+    heartbeat_bpm: f32,
+    heartbeat_conf: f32,
+    anomaly_score: f32,
+    env_shift_score: f32,
+    node_coherence: f32,
+    quality_flags: u16,
+}
+
+/// Parse a 60-byte ADR-081 feature state packet (magic 0xC5110006).
+fn parse_rv_feature_state(buf: &[u8]) -> Option<RvFeatureStatePacket> {
+    if buf.len() < 60 {
+        return None;
+    }
+    let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if magic != 0xC511_0006 {
+        return None;
+    }
+    Some(RvFeatureStatePacket {
+        node_id:         buf[4],
+        mode:            buf[5],
+        seq:             u16::from_le_bytes([buf[6],  buf[7]]),
+        ts_us:           u64::from_le_bytes([buf[8],  buf[9],  buf[10], buf[11],
+                                             buf[12], buf[13], buf[14], buf[15]]),
+        motion_score:    f32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
+        presence_score:  f32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
+        respiration_bpm: f32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
+        respiration_conf:f32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]),
+        heartbeat_bpm:   f32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
+        heartbeat_conf:  f32::from_le_bytes([buf[36], buf[37], buf[38], buf[39]]),
+        anomaly_score:   f32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]),
+        env_shift_score: f32::from_le_bytes([buf[44], buf[45], buf[46], buf[47]]),
+        node_coherence:  f32::from_le_bytes([buf[48], buf[49], buf[50], buf[51]]),
+        quality_flags:   u16::from_le_bytes([buf[52], buf[53]]),
+    })
+}
+
 // ── ADR-040: WASM Output Packet (magic 0xC511_0004) ───────────────────────────
 
 /// Single WASM event (type + value).
@@ -4772,6 +4821,127 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     }
                     s.latest_update = Some(update);
                     s.edge_vitals = Some(vitals);
+                    continue;
+                }
+
+                // ADR-081: Try feature state packet (magic 0xC5110006).
+                if let Some(fs) = parse_rv_feature_state(&buf[..len]) {
+                    let presence = (fs.quality_flags & 0x01) != 0;
+                    let degraded = (fs.quality_flags & 0x20) != 0;
+                    debug!(
+                        "ESP32 feature_state from {src}: node={} pres={:.2} motion={:.2} resp={:.1}bpm{}",
+                        fs.node_id, fs.presence_score, fs.motion_score, fs.respiration_bpm,
+                        if degraded { " [DEGRADED]" } else { "" }
+                    );
+                    let now = std::time::Instant::now();
+                    let mut s = state.write().await;
+                    s.source = "esp32".to_string();
+                    s.last_esp32_frame = Some(now);
+
+                    let node_id = fs.node_id;
+                    let node_est = if presence { 1usize } else { 0 };
+
+                    // Update per-node state; extract sync before releasing borrow.
+                    let sync_snap = {
+                        let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
+                        ns.last_frame_time = Some(now);
+                        ns.prev_person_count = node_est;
+                        ns.sync_snapshot()
+                    };
+
+                    let motion_level = if fs.motion_score > 0.5 {
+                        "present_moving"
+                    } else if presence {
+                        "present_still"
+                    } else {
+                        "absent"
+                    };
+
+                    s.tick += 1;
+                    let tick = s.tick;
+
+                    let features = FeatureInfo {
+                        mean_rssi: 0.0,
+                        variance: fs.motion_score as f64,
+                        motion_band_power: fs.motion_score as f64,
+                        breathing_band_power: if presence { 0.5 } else { 0.0 },
+                        dominant_freq_hz: (fs.respiration_bpm / 60.0) as f64,
+                        change_points: 0,
+                        spectral_power: fs.motion_score as f64,
+                    };
+                    let classification = ClassificationInfo {
+                        motion_level: motion_level.to_string(),
+                        presence,
+                        confidence: fs.presence_score as f64,
+                    };
+                    let signal_field = SignalField {
+                        grid_size: [1, 1, 1],
+                        values: vec![fs.presence_score as f64],
+                    };
+                    let node_features = build_node_features(&s.node_states, now);
+
+                    let update = SensingUpdate {
+                        msg_type: "sensing_update".to_string(),
+                        timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
+                        source: "esp32".to_string(),
+                        tick,
+                        nodes: vec![NodeInfo {
+                            node_id,
+                            rssi_dbm: 0.0,
+                            position: [2.0, 0.0, 1.5],
+                            amplitude: vec![],
+                            subcarrier_count: 0,
+                            sync: sync_snap,
+                        }],
+                        features,
+                        classification,
+                        signal_field,
+                        vital_signs: if fs.respiration_bpm > 0.0 {
+                            Some(VitalSigns {
+                                breathing_rate_bpm: Some(fs.respiration_bpm as f64),
+                                heart_rate_bpm: if fs.heartbeat_bpm > 0.0 {
+                                    Some(fs.heartbeat_bpm as f64)
+                                } else {
+                                    None
+                                },
+                                breathing_confidence: fs.respiration_conf as f64,
+                                heartbeat_confidence: fs.heartbeat_conf as f64,
+                                signal_quality: fs.node_coherence as f64,
+                            })
+                        } else {
+                            None
+                        },
+                        enhanced_motion: None,
+                        enhanced_breathing: None,
+                        posture: None,
+                        signal_quality_score: None,
+                        quality_verdict: None,
+                        bssid_count: None,
+                        pose_keypoints: None,
+                        model_status: None,
+                        persons: None,
+                        estimated_persons: if node_est > 0 { Some(node_est) } else { None },
+                        node_features,
+                    };
+                    if let Ok(json) = serde_json::to_string(&update) {
+                        let _ = s.tx.send(json);
+                    }
+                    s.latest_update = Some(update);
+
+                    // Broadcast raw feature state for debugging via WebSocket.
+                    if let Ok(json) = serde_json::to_string(&serde_json::json!({
+                        "type": "rv_feature_state",
+                        "node_id": fs.node_id,
+                        "motion_score": fs.motion_score,
+                        "presence_score": fs.presence_score,
+                        "respiration_bpm": fs.respiration_bpm,
+                        "heartbeat_bpm": fs.heartbeat_bpm,
+                        "anomaly_score": fs.anomaly_score,
+                        "quality_flags": fs.quality_flags,
+                        "degraded": degraded,
+                    })) {
+                        let _ = s.tx.send(json);
+                    }
                     continue;
                 }
 
