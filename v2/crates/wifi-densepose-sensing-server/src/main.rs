@@ -4842,6 +4842,7 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                     let node_est = if presence { 1usize } else { 0 };
 
                     // Update per-node state; extract sync before releasing borrow.
+                    // Rate-limit WebSocket broadcasts to 2 Hz per node to prevent UI flicker.
                     let sync_snap = {
                         let ns = s.node_states.entry(node_id).or_insert_with(NodeState::new);
                         ns.last_frame_time = Some(now);
@@ -4923,25 +4924,14 @@ async fn udp_receiver_task(state: SharedState, udp_port: u16) {
                         estimated_persons: if node_est > 0 { Some(node_est) } else { None },
                         node_features,
                     };
-                    if let Ok(json) = serde_json::to_string(&update) {
-                        let _ = s.tx.send(json);
+                    // Rate-limit to ~2 Hz per node: broadcast every 3rd packet (firmware sends 5 Hz).
+                    if fs.seq % 3 == 0 {
+                        if let Ok(json) = serde_json::to_string(&update) {
+                            let _ = s.tx.send(json);
+                        }
                     }
                     s.latest_update = Some(update);
 
-                    // Broadcast raw feature state for debugging via WebSocket.
-                    if let Ok(json) = serde_json::to_string(&serde_json::json!({
-                        "type": "rv_feature_state",
-                        "node_id": fs.node_id,
-                        "motion_score": fs.motion_score,
-                        "presence_score": fs.presence_score,
-                        "respiration_bpm": fs.respiration_bpm,
-                        "heartbeat_bpm": fs.heartbeat_bpm,
-                        "anomaly_score": fs.anomaly_score,
-                        "quality_flags": fs.quality_flags,
-                        "degraded": degraded,
-                    })) {
-                        let _ = s.tx.send(json);
-                    }
                     continue;
                 }
 
